@@ -1,0 +1,188 @@
+# Import necessary libraries
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Hyperparameters
+latent_dim = 128  # Increased latent dimension for more complex feature generation
+img_channels = 3  # CIFAR-10 has 3 color channels
+img_size = 32  # CIFAR-10 images are 32x32
+batch_size = 512  # Increased batch size for better gradient estimation
+learning_rate = 0.0001  # Reduced learning rate for more stable training
+num_epochs = 200  # Increased number of epochs for more extensive training
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+print("Using device: ", device)
+
+# Data Loading
+transform = transforms.Compose([
+    transforms.Resize(img_size),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5], [0.5], [0.5])
+])
+dataset = torchvision.datasets.CIFAR10(root="./data", train=True, transform=transform, download=True)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+# Generator Model
+class Generator(nn.Module):
+    def __init__(self, input_dim, output_channels):
+        super(Generator, self).__init__()
+        self.model = nn.Sequential(
+            nn.ConvTranspose2d(input_dim, 512, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(512, 256, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(128, output_channels, 4, 2, 1, bias=False),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+# Discriminator Model
+class Discriminator(nn.Module):
+    def __init__(self, input_channels):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(input_channels, 128, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Conv2d(128, 256, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Conv2d(256, 512, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Conv2d(512, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.model(x).view(-1, 1)
+
+# Initialize models
+generator = Generator(latent_dim, img_channels).to(device)
+discriminator = Discriminator(img_channels).to(device)
+
+# Loss and Optimizers
+criterion = nn.BCELoss()
+g_optimizer = optim.Adam(generator.parameters(), lr=learning_rate, betas=(0.5, 0.999))  # Added betas for more stable Adam
+d_optimizer = optim.Adam(discriminator.parameters(), lr=learning_rate, betas=(0.5, 0.999))
+
+# Scheduler for dynamic learning rate
+g_scheduler = optim.lr_scheduler.StepLR(g_optimizer, step_size=50, gamma=0.5)
+d_scheduler = optim.lr_scheduler.StepLR(d_optimizer, step_size=50, gamma=0.5)
+
+# Utility function to denormalize images
+def denormalize(img):
+    img = img * 0.5 + 0.5
+    return img
+
+# Training Loop
+g_losses = []
+d_losses = []
+
+for epoch in range(num_epochs):
+    for i, (imgs, _) in enumerate(dataloader):
+        # Move images to device
+        real_imgs = imgs.to(device)
+        batch_size = real_imgs.size(0)
+
+        # Labels for real and fake images with label smoothing
+        real_labels = torch.ones(batch_size, 1).uniform_(0.9, 1.0).to(device)  # Label smoothing for real labels
+        fake_labels = torch.zeros(batch_size, 1).to(device)
+
+        # Train Discriminator
+        z = torch.randn(batch_size, latent_dim, 1, 1).to(device)
+        fake_imgs = generator(z)
+
+        real_loss = criterion(discriminator(real_imgs), real_labels)
+        fake_loss = criterion(discriminator(fake_imgs.detach()), fake_labels)
+        d_loss = real_loss + fake_loss
+
+        d_optimizer.zero_grad()
+        d_loss.backward()
+        d_optimizer.step()
+
+        # Train Generator
+        z = torch.randn(batch_size, latent_dim, 1, 1).to(device)
+        fake_imgs = generator(z)
+        g_loss = criterion(discriminator(fake_imgs), real_labels)
+
+        g_optimizer.zero_grad()
+        g_loss.backward()
+        g_optimizer.step()
+
+        # Save losses for plotting
+        g_losses.append(g_loss.item())
+        d_losses.append(d_loss.item())
+
+    # Step the learning rate scheduler
+    g_scheduler.step()
+    d_scheduler.step()
+
+    # Print progress
+    print(f"Epoch [{epoch+1}/{num_epochs}]  D Loss: {d_loss.item():.4f}  G Loss: {g_loss.item():.4f}")
+
+    # Visualize the generated images at certain epochs
+    if epoch % 10 == 0 or epoch == num_epochs - 1:
+        with torch.no_grad():
+            z = torch.randn(16, latent_dim, 1, 1).to(device)
+            sample_imgs = generator(z)
+            grid = torchvision.utils.make_grid(sample_imgs, nrow=4, normalize=True)
+            plt.figure(figsize=(8, 8))
+            plt.imshow(np.transpose(grid.cpu().numpy(), (1, 2, 0)))
+            plt.title(f"Generated Images at Epoch {epoch+1}")
+            plt.axis("off")
+            plt.show()
+
+# Latent Space Interpolation for CIFAR-10 Dataset
+z_start = torch.randn(1, latent_dim, 1, 1).to(device)
+z_end = torch.randn(1, latent_dim, 1, 1).to(device)
+
+# Generate interpolation steps
+num_interpolations = 10
+interpolated_images = []
+
+for alpha in np.linspace(0, 1, num_interpolations):
+    z = (1 - alpha) * z_start + alpha * z_end
+    with torch.no_grad():
+        interpolated_image = generator(z).cpu()
+        interpolated_images.append(interpolated_image)
+
+# Plot interpolated images
+plt.figure(figsize=(20, 4))
+for i, img in enumerate(interpolated_images):
+    plt.subplot(1, num_interpolations, i + 1)
+    plt.imshow(np.transpose(img.squeeze().numpy(), (1, 2, 0)))
+    plt.axis("off")
+    plt.title(f"Step {i+1}")
+plt.suptitle("Latent Space Interpolation Between Two Images (CIFAR-10)")
+plt.show()
+
+# Comment on the smoothness of the interpolation
+# The latent space interpolation shows a smooth transition between two generated images. 
+# The quality of the transitions can indicate how well the generator has learned the underlying data distribution. 
+# Ideally, the intermediate images should look realistic and transition gradually without abrupt changes, 
+# which reflects a well-structured latent space.
+
+# Plot the loss curves
+plt.figure(figsize=(10, 5))
+plt.plot(g_losses, label="Generator Loss")
+plt.plot(d_losses, label="Discriminator Loss")
+plt.xlabel("Iterations")
+plt.ylabel("Loss")
+plt.legend()
+plt.title("Generator and Discriminator Loss During Training")
+plt.show()
